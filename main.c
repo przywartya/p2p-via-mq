@@ -339,4 +339,3 @@ int main(int argc, char** argv) {
 	closeQueue(&queue, myPid);
 	return EXIT_SUCCESS;
 }
-
