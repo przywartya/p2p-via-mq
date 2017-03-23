@@ -37,6 +37,9 @@ void subscribeToMessageQueue(mqd_t *queue);
 void mq_handler(int sig, siginfo_t *info, void *p);
 void intHandler(int sig, siginfo_t *info, void *p);
 char* concat(const char *s1, const char *s2);
+void sendMessageToOneNeighbour(char* pid, char* s);
+void sendMessageToAllNeighbours(char* pid, char* s);
+void sendMessageToAllNeighboursWithoutCallingProcess(char* callingProcessPID, char* receivedMessage);
 
 
 int main(int argc, char** argv) {
@@ -47,27 +50,19 @@ int main(int argc, char** argv) {
 	printf("PID: [%s]\n\n", myPid);
 	mqd_t queue;
 	initializeQueue(&queue, myPid);
-
 	sethandler(intHandler, SIGINT);
 	sethandler(mq_handler, SIGRTMIN);
 	subscribeToMessageQueue(&queue);
-
 	mqd_t neighbourQueue;
-	if (neighbourPid != NULL) {
-		initializeQueue(&neighbourQueue, neighbourPid);
-		//printf("Sending message from [%s] to [%s]\n", myPid, neighbourPid);		
-		if(TEMP_FAILURE_RETRY(mq_send(neighbourQueue,(const char*)myPid,strlen(myPid),0))) {
-			ERR("mq_send");
-		}
+	if (neighbourPid != NULL){
+		initializeQueue(&neighbourQueue, neighbourPid);	
+		if(TEMP_FAILURE_RETRY(mq_send(neighbourQueue,(const char*)myPid,strlen(myPid),3))) ERR("mq_send");
 	}
-	
 	while(1){
 		if(neighboursSize>0){
-			int n;
 			char msg[MAX_MSG_LENGTH];
 			char pid[MAX_PID_LENGTH];
-			n = scanf("%10s %20s", pid, msg);
-			if (n == 2){
+			if (scanf("%10s %20s", pid, msg) == 2){
 				prepend(msg, " ");
 				msg[strlen(msg)] = '\0';
 				char* s = concat(pid, msg);
@@ -75,39 +70,16 @@ int main(int argc, char** argv) {
 					printf("Message too long!\n");
 					continue;
 				}
-				if(checkIfGivenPidInNeighbours(pid)){
-					mqd_t targetQueue;
-					prepend(pid, "/");
-					targetQueue = TEMP_FAILURE_RETRY(mq_open(pid,O_RDWR | O_NONBLOCK,0600));
-					if (targetQueue == (mqd_t)-1) {
-						ERR("Error opening queue");
-					}
-					mq_send(targetQueue, (const char*)s, strlen(s), 2);
-					mq_close(targetQueue);
-				}
-				else if(isdigit(pid[0]) && isdigit(pid[strlen(pid)]) && strlen(pid)>1 && strlen(msg)>1){
-					int i;
-					for (i = 0; i < neighboursSize; i++) {
-						mqd_t targetQueue;
-						strcpy(pid, neighbours[i]);
-						prepend(pid, "/");
-						targetQueue = TEMP_FAILURE_RETRY(mq_open(pid,O_RDWR | O_NONBLOCK,0600));
-						if (targetQueue == (mqd_t)-1) {
-							ERR("Error opening queue");
-						}
-						mq_send(targetQueue, (const char*)s, strlen(s), 2);
-						printf("%s send to %s\n", s, pid);
-						mq_close(targetQueue);
-					}
-				} else {
+				if(checkIfGivenPidInNeighbours(pid))
+					sendMessageToOneNeighbour(pid, s);
+				else if(isdigit(pid[0]))
+					sendMessageToAllNeighbours(pid, s);
+				else 
 					printf("Please enter correct message [PID MSG]\n");
-				}
 			}
 		}
 	}
-	if (neighbourPid != NULL) {
-		closeQueue(&neighbourQueue, neighbourPid);
-	}
+	if (neighbourPid != NULL) closeQueue(&neighbourQueue, neighbourPid);
 	closeQueue(&queue, myPid);
 	return EXIT_SUCCESS;
 }
@@ -252,29 +224,34 @@ void subscribeToMessageQueue(mqd_t *queue) {
 	}
 }
 
-void mq_handler(int sig, siginfo_t *info, void *p) {
-	mqd_t *pin;
-	char clientPid[MAX_MSG_LENGTH];
-	unsigned msg_prio;
-
-	pin = (mqd_t *)info->si_value.sival_ptr;
-	subscribeToMessageQueue(pin);
-
+char* getCallingProcessPID(siginfo_t *info){
 	long sPid;
 	sPid = (long )info->si_pid;
 	char* callingProcessPID;
 	callingProcessPID = (char*) malloc(sizeof(char) * countDigits(sPid));
 	sprintf(callingProcessPID, "%ld", sPid);
+	return callingProcessPID;
+}
 
+char* getMyProcessPID(){
 	long mPid;
 	mPid = (long)getpid();
 	char* myPID;
 	myPID = (char*) malloc(sizeof(char) * countDigits(mPid));
 	sprintf(myPID, "%ld", mPid);
+	return myPID;
+}
 
+void mq_handler(int sig, siginfo_t *info, void *p) {
+	mqd_t *pin;
+	char receivedMessage[MAX_MSG_LENGTH];
+	pin = (mqd_t *)info->si_value.sival_ptr;
+	subscribeToMessageQueue(pin);
+	char* callingProcessPID = getCallingProcessPID(info);
+	char* myPID = getMyProcessPID();
 	for(;;){
 		int bytesRead;
-		if((bytesRead = mq_receive(*pin, clientPid, sizeof(pid_t) + sizeof(char) * MAX_MSG_LENGTH, NULL))<1) {
+		if((bytesRead = mq_receive(*pin, receivedMessage, sizeof(pid_t) + sizeof(char) * MAX_MSG_LENGTH, NULL))<1) {
 			if(errno==EAGAIN) break;
 			else ERR("mq_receive");
 		}
@@ -284,39 +261,67 @@ void mq_handler(int sig, siginfo_t *info, void *p) {
 					printf("Maximal number of clients reached!\n");
 					return;
 				}
-				clientPid[bytesRead] = '\0';
-				addNeighbour(clientPid);
+				receivedMessage[bytesRead] = '\0';
+				addNeighbour(receivedMessage);
 				printNeighbours();
 			} else {
-				char destinationPid[4];
-				strncpy(destinationPid, clientPid,4);
-				destinationPid[4] = '\0';
+				char* destinationPid = (char*) malloc(sizeof(char) * strlen(myPID));
+				strncpy(destinationPid, receivedMessage,strlen(myPID));
 				if(strcmp(destinationPid,myPID)==0){
-					printf("Received message [%s], it goes to:[%s]\n", clientPid, destinationPid);
-					//ja jestem odbiarca wiec czytam i spoko
+					printf("Received message [%s]\n", receivedMessage);
 				} else {
-					//wyslij do wszystkich swoich neighborsow oprocz callingprocessid
-					int i;
-					printf("Received message [%s], it goes to:[%s]\n", clientPid, destinationPid);
-					for (i = 0; i < neighboursSize; i++) {
-						if(strcmp(neighbours[i],callingProcessPID)==0){
-							continue;
-						}
-						char pid[6];
-						mqd_t targetQueue;
-						strcpy(pid, neighbours[i]);
-						prepend(pid, "/");
-						targetQueue = TEMP_FAILURE_RETRY(mq_open(pid,O_RDWR | O_NONBLOCK,0600));
-						if (targetQueue == (mqd_t)-1) {
-							ERR("Error opening queue");
-						}
-						mq_send(targetQueue, (const char*)clientPid, strlen(clientPid), 2);
-						printf("%s send to %s\n", clientPid, pid);
-						mq_close(targetQueue);
-					}
+					sendMessageToAllNeighboursWithoutCallingProcess(callingProcessPID, receivedMessage);
 				}
 			}
 		}
+	}
+}
+
+void sendMessageToOneNeighbour(char* pid, char* s){
+	mqd_t targetQueue;
+	prepend(pid, "/");
+	targetQueue = TEMP_FAILURE_RETRY(mq_open(pid,O_RDWR | O_NONBLOCK,0600));
+	if (targetQueue == (mqd_t)-1) {
+		ERR("Error opening queue");
+	}
+	mq_send(targetQueue, (const char*)s, strlen(s), 2);
+	mq_close(targetQueue);
+}
+
+void sendMessageToAllNeighboursWithoutCallingProcess(char* callingProcessPID, char* receivedMessage){
+	int i;
+	//printf("Received message [%s]\n", receivedMessage);
+	for (i = 0; i < neighboursSize; i++) {
+		if(strcmp(neighbours[i],callingProcessPID)==0){
+			continue;
+		}
+		char pid[MAX_PID_LENGTH];
+		mqd_t targetQueue;
+		strcpy(pid, neighbours[i]);
+		prepend(pid, "/");
+		targetQueue = TEMP_FAILURE_RETRY(mq_open(pid,O_RDWR | O_NONBLOCK,0600));
+		if (targetQueue == (mqd_t)-1) {
+			ERR("Error opening queue");
+		}
+		mq_send(targetQueue, (const char*)receivedMessage, strlen(receivedMessage), 2);
+		printf("[%s] send to %s\n", receivedMessage, pid);
+		mq_close(targetQueue);
+	}
+}
+
+void sendMessageToAllNeighbours(char* pid, char* s){
+	int i;
+	for (i = 0; i < neighboursSize; i++) {
+		mqd_t targetQueue;
+		strcpy(pid, neighbours[i]);
+		prepend(pid, "/");
+		targetQueue = TEMP_FAILURE_RETRY(mq_open(pid,O_RDWR | O_NONBLOCK,0600));
+		if (targetQueue == (mqd_t)-1) {
+			ERR("Error opening queue");
+		}
+		mq_send(targetQueue, (const char*)s, strlen(s), 2);
+		//printf("%s send to %s\n", s, pid);
+		mq_close(targetQueue);
 	}
 }
 
