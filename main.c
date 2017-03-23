@@ -8,10 +8,8 @@
 #include <errno.h>
 #include <string.h>
 #include <time.h>
+#include <ctype.h>
 #include <mqueue.h>
-
-#define LIFE_SPAN 10
-#define MAX_NUM 10
 #define MAX_PID_LENGTH 10
 #define MAXMSG 10
 #define MAX_MSG_LENGTH 20
@@ -24,6 +22,95 @@
 
 char **neighbours;
 int neighboursSize = 0;
+int checkIfGivenPidInNeighbours(char* pid);
+void prepend(char* s, const char* t);
+void closeQueue(mqd_t *queue, char *queueId);
+void initializeQueue(mqd_t *queue, char *queueId);
+void sethandler( void (*f)(int, siginfo_t*, void*), int sigNo);
+int countDigits(long number);
+void createCurrentProcessPidString(char **myPid);
+void printNeighbours();
+void addNeighbour(char *neighbourPid);
+void removeNeighbour(char* neighbourPid);
+void parseNeighbourPidFromArgs(char **neighbourPid, char **argv);
+void subscribeToMessageQueue(mqd_t *queue);
+void mq_handler(int sig, siginfo_t *info, void *p);
+void intHandler(int sig, siginfo_t *info, void *p);
+char* concat(const char *s1, const char *s2);
+
+
+int main(int argc, char** argv) {
+	char *neighbourPid = NULL;
+	char *myPid;
+	parseNeighbourPidFromArgs(&neighbourPid, argv);
+	createCurrentProcessPidString(&myPid);
+	printf("PID: [%s]\n\n", myPid);
+	mqd_t queue;
+	initializeQueue(&queue, myPid);
+
+	sethandler(intHandler, SIGINT);
+	sethandler(mq_handler, SIGRTMIN);
+	subscribeToMessageQueue(&queue);
+
+	mqd_t neighbourQueue;
+	if (neighbourPid != NULL) {
+		initializeQueue(&neighbourQueue, neighbourPid);
+		//printf("Sending message from [%s] to [%s]\n", myPid, neighbourPid);		
+		if(TEMP_FAILURE_RETRY(mq_send(neighbourQueue,(const char*)myPid,strlen(myPid),0))) {
+			ERR("mq_send");
+		}
+	}
+	
+	while(1){
+		if(neighboursSize>0){
+			int n;
+			char msg[MAX_MSG_LENGTH];
+			char pid[MAX_PID_LENGTH];
+			n = scanf("%10s %20s", pid, msg);
+			if (n == 2){
+				prepend(msg, " ");
+				msg[strlen(msg)] = '\0';
+				char* s = concat(pid, msg);
+				if(strlen(s)>MAX_PID_LENGTH+MAX_MSG_LENGTH+2) {
+					printf("Message too long!\n");
+					continue;
+				}
+				if(checkIfGivenPidInNeighbours(pid)){
+					mqd_t targetQueue;
+					prepend(pid, "/");
+					targetQueue = TEMP_FAILURE_RETRY(mq_open(pid,O_RDWR | O_NONBLOCK,0600));
+					if (targetQueue == (mqd_t)-1) {
+						ERR("Error opening queue");
+					}
+					mq_send(targetQueue, (const char*)s, strlen(s), 2);
+					mq_close(targetQueue);
+				}
+				else if(isdigit(pid[0]) && isdigit(pid[strlen(pid)]) && strlen(pid)>1 && strlen(msg)>1){
+					int i;
+					for (i = 0; i < neighboursSize; i++) {
+						mqd_t targetQueue;
+						strcpy(pid, neighbours[i]);
+						prepend(pid, "/");
+						targetQueue = TEMP_FAILURE_RETRY(mq_open(pid,O_RDWR | O_NONBLOCK,0600));
+						if (targetQueue == (mqd_t)-1) {
+							ERR("Error opening queue");
+						}
+						mq_send(targetQueue, (const char*)s, strlen(s), 2);
+						printf("%s send to %s\n", s, pid);
+						mq_close(targetQueue);
+					}
+				} else {
+					printf("Please enter correct message [PID MSG]\n");
+				}
+			}
+		}
+	}
+	if (neighbourPid != NULL) {
+		closeQueue(&neighbourQueue, neighbourPid);
+	}
+	closeQueue(&queue, myPid);
+	return EXIT_SUCCESS;
+}
 
 int checkIfGivenPidInNeighbours(char* pid){
 	int i;
@@ -121,8 +208,9 @@ void addNeighbour(char *neighbourPid) {
 	} else {	
 		neighbours = (char**) realloc(neighbours, sizeof(char*) * neighboursSize);
 	}
-	
+	if(!neighbours) ERR("malloc");
 	neighbours[neighboursSize - 1] = (char*) malloc(sizeof(char) * strlen(neighbourPid));
+	if(!neighbours[neighboursSize - 1]) ERR("malloc");
 	strcpy(neighbours[neighboursSize-1], neighbourPid);
 }
 
@@ -147,6 +235,7 @@ void removeNeighbour(char* neighbourPid){
 void parseNeighbourPidFromArgs(char **neighbourPid, char **argv) {
 	if (argv[1] != NULL && strlen(argv[1]) > 0) {
 		*neighbourPid = (char*) malloc(sizeof(char) * strlen(argv[1]));
+		if(!neighbourPid) ERR("malloc");
 		strcpy(*neighbourPid, argv[1]);
 		addNeighbour(*neighbourPid);
 		printNeighbours();
@@ -264,78 +353,4 @@ char* concat(const char *s1, const char *s2){
     strcpy(result, s1);
     strcat(result, s2);
     return result;
-}
-
-int main(int argc, char** argv) {
-	
-	char *neighbourPid = NULL;
-	char *myPid;
-	
-	parseNeighbourPidFromArgs(&neighbourPid, argv);
-
-	createCurrentProcessPidString(&myPid);
-
-	printf("PID: [%s]\n\n", myPid);
-
-	mqd_t queue;
-	initializeQueue(&queue, myPid);
-
-	sethandler(intHandler, SIGINT);
-	sethandler(mq_handler, SIGRTMIN);
-	subscribeToMessageQueue(&queue);
-
-	mqd_t neighbourQueue;
-	if (neighbourPid != NULL) {
-		initializeQueue(&neighbourQueue, neighbourPid);
-		//printf("Sending message from [%s] to [%s]\n", myPid, neighbourPid);		
-		if(TEMP_FAILURE_RETRY(mq_send(neighbourQueue,(const char*)myPid,strlen(myPid),0))) {
-			ERR("mq_send");
-		}
-	}
-	
-	while(1){
-		if(neighboursSize>0){
-			//printf("Now you can enter a message to send to one of the neighbours above!\n");	
-			char msg[18];
-			char pid[6];
-			scanf("%5s %17s", pid, msg); //ten scanf tu czeka i dostaje gowno od innego procesu
-			char* s = concat(pid, msg);
-			if(strlen(s)>MAX_MSG_LENGTH+4) ERR("Message too long!");
-			if(checkIfGivenPidInNeighbours(pid)){
-				mqd_t targetQueue;
-				prepend(pid, "/");
-				targetQueue = TEMP_FAILURE_RETRY(mq_open(pid,O_RDWR | O_NONBLOCK,0600));
-				if (targetQueue == (mqd_t)-1) {
-					ERR("Error opening queue");
-				}
-				mq_send(targetQueue, (const char*)s, strlen(s), 2);
-				mq_close(targetQueue);
-				//printf("%s send to %s\n", s, pid);
-			}
-			else if(strlen(pid)>1 && strlen(msg)>1){
-				printf("Cotojest %s\n", pid);
-				int i;
-				for (i = 0; i < neighboursSize; i++) {
-					mqd_t targetQueue;
-					strcpy(pid, neighbours[i]);
-					prepend(pid, "/");
-					targetQueue = TEMP_FAILURE_RETRY(mq_open(pid,O_RDWR | O_NONBLOCK,0600));
-					if (targetQueue == (mqd_t)-1) {
-						ERR("Error opening queue");
-					}
-					mq_send(targetQueue, (const char*)s, strlen(s), 2);
-					printf("%s send to %s\n", s, pid);
-					mq_close(targetQueue);
-				}
-				//printf("Please enter pid from the ones listed above.\n");
-			} else{
-				//sygnalinperupt
-			}
-		}
-	}
-	if (neighbourPid != NULL) {
-		closeQueue(&neighbourQueue, neighbourPid);
-	}
-	closeQueue(&queue, myPid);
-	return EXIT_SUCCESS;
 }
